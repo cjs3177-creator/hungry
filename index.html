@@ -1,0 +1,504 @@
+# =====================================================================================
+#  3차원 오차 요인이 반영된 진자 운동 및 주기(T) 측정 물리 실험 시뮬레이션
+#  ------------------------------------------------------------------------------------
+#  · 실행 환경 : Google Colab / Jupyter (ipywidgets 기반 대화형 UI)
+#  · 사용 모듈 : numpy, scipy, matplotlib, ipywidgets, IPython.display  (코랩 기본 내장)
+#  · 물리 모델 : 대각도 비선형 진자 + 2차 공기저항 + 원뿔진자(3D) 섭동 + 실의 미세 떨림
+#  · 측정 모델 : 영점 정방향 통과 시각 검출 → 10회 왕복 시간 → 인간 반응오차(±10%) 부여
+# =====================================================================================
+
+import gc
+import numpy as np
+from scipy.integrate import solve_ivp
+
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib import animation
+from matplotlib import font_manager
+
+import ipywidgets as widgets
+from IPython.display import display, HTML
+
+# Colab 인라인 렌더링 보장 (스크립트로 실행될 때는 무시)
+try:
+    from IPython import get_ipython
+    get_ipython().run_line_magic("matplotlib", "inline")
+except Exception:
+    pass
+
+
+# =====================================================================================
+# 0. 물리 상수 및 전역 설정
+# =====================================================================================
+G        = 9.80665     # 중력가속도 [m/s^2]
+RHO_AIR  = 1.225       # 공기 밀도 [kg/m^3]
+MU_AIR   = 1.81e-5     # 공기 점성계수 [Pa·s]  (선형 항 b 계산용)
+C_D      = 0.47        # 구(球) 형태 추의 항력계수 (무차원)
+RHO_BOB  = 7800.0      # 추의 밀도(강철 기준) [kg/m^3] → 질량으로부터 반지름/단면적 산출
+
+DRAG_SCALE = 1.0       # 감쇠 가시성 조절용 배율(수업용으로 감쇠를 더 뚜렷하게 하려면 3~5 권장)
+
+N_CYCLES   = 10        # 측정할 왕복 횟수
+DELTA_MAX  = 0.10      # 측정 오차 delta 의 최대 크기 (±10%)
+DELTA_SIG  = 0.04      # 측정 오차 delta 의 표준편차 (절단 정규분포)
+
+FRAME_MAX  = 90        # 애니메이션 최대 프레임 수 (코랩 메모리 보호)
+ANIM_DPI   = 64        # 애니메이션 프레임 해상도 (낮출수록 용량·메모리 절감)
+
+
+# -------------------------------------------------------------------------------------
+# 한글 폰트 자동 탐색 : 코랩에는 한글 폰트가 없을 수 있으므로(외부 다운로드 금지 조건),
+#                      폰트가 없으면 그래프 축 라벨만 영문으로 자동 대체한다.
+#                      (위젯 라벨과 HTML 리포트는 브라우저가 렌더링하므로 항상 한글)
+# -------------------------------------------------------------------------------------
+def _setup_font():
+    """시스템에 설치된 한글 폰트를 찾아 matplotlib 에 적용. 성공 시 True."""
+    candidates = ("NanumGothic", "NanumBarunGothic", "Malgun Gothic", "AppleGothic",
+                  "Noto Sans CJK KR", "Noto Sans KR", "UnDotum", "Gulim")
+    installed = {f.name for f in font_manager.fontManager.ttflist}
+    for name in candidates:
+        if name in installed:
+            matplotlib.rcParams["font.family"] = name
+            matplotlib.rcParams["axes.unicode_minus"] = False
+            return True
+    matplotlib.rcParams["axes.unicode_minus"] = False
+    return False
+
+
+KO_FONT = _setup_font()
+
+# 그래프용 라벨 (한글 폰트 유무에 따라 자동 선택)
+LBL = {
+    "traj3d": ("진자 추의 3차원 궤적", "3D Trajectory of the Bob"),
+    "theta":  ("시간에 따른 각변위 θ(t)", "Angular Displacement θ(t)"),
+    "time":   ("시간 t [s]", "time t [s]"),
+    "ang":    ("각변위 θ [deg]", "angle θ [deg]"),
+    "cross":  ("영점 정방향 통과", "zero up-crossing"),
+    "start":  ("출발점", "start"),
+    "top":    ("위에서 본 궤적 (x–y 평면)", "Top View (x-y plane)"),
+    "note":   ("※ y축 확대", "* y axis magnified"),
+}
+def L(key):
+    """한글 폰트가 있으면 한글 라벨, 없으면 영문 라벨을 반환."""
+    return LBL[key][0] if KO_FONT else LBL[key][1]
+
+
+# =====================================================================================
+# 1. 물리 엔진 : 3차원 오차 요인이 포함된 진자 운동 방정식
+# =====================================================================================
+# 상태 변수 y = [theta, omega, psi, psi_dot]
+#   theta : 주 진동면(x–z 평면) 안에서의 각변위      [rad]
+#   psi   : 주 진동면에 직교(y 방향)하는 미세 각변위 [rad]  → 원뿔진자/리사주 효과
+#
+#   d²θ/dt² = -(g / l(t))·sinθ  -  (b/m)·ω  -  (k_q/m)·|v|·ω
+#   d²ψ/dt² = -(g / l(t))·(1+ε)·sinψ - (b/m)·ψ' - (k_q/m)·|v|·ψ'
+#
+#   · l(t) = l₀ + A·sin(ω_s t)                : 실의 고주파 미세 떨림(진폭 A ~ 정규분포)
+#   · b    = 6πμr                              : 저속 선형 저항(스토크스 항)
+#   · k_q  = ½·C_d·ρ·A_cs                      : 속도의 제곱에 비례하는 공기저항
+#     → 각가속도 항이 1/m 에 비례하므로 질량 m 이 작을수록 감쇠가 빠르다.
+#   · ε    : 직교 방향의 미세 진동수 어긋남 → 진동면이 서서히 회전(세차)하며 리사주 궤적 생성
+# =====================================================================================
+
+def _bob_geometry(m_kg):
+    """질량으로부터 구형 추의 반지름 r [m] 과 단면적 A [m^2] 를 산출."""
+    r = (3.0 * m_kg / (4.0 * np.pi * RHO_BOB)) ** (1.0 / 3.0)
+    return r, np.pi * r * r
+
+
+def _string_length(t, p):
+    """실의 미세 떨림이 반영된 순간 길이 l(t) [m]."""
+    return p["l0"] + p["A_str"] * np.sin(p["w_str"] * t + p["ph_str"])
+
+
+def _rhs(t, y, p):
+    """진자 운동 방정식의 우변 (3차원 섭동 포함)."""
+    th, om, ps, oms = y
+    l_t = _string_length(t, p)
+
+    # 추의 실제 속력 (주 진동 + 직교 섭동의 합성)
+    v_mag = l_t * np.sqrt(om * om + oms * oms)
+
+    # 감쇠 계수 (선형 스토크스 + 2차 공기저항), 모두 1/m 에 비례
+    c_lin = p["b_lin"] / p["m"]
+    c_qua = p["k_qua"] / p["m"] * v_mag
+
+    a_th = -(G / l_t) * np.sin(th) - c_lin * om - c_qua * om
+    a_ps = -(G / l_t) * (1.0 + p["eps"]) * np.sin(ps) - c_lin * oms - c_qua * oms
+    return [om, a_th, oms, a_ps]
+
+
+def _event_up_cross(t, y, p):
+    """θ = 0 통과 감지 이벤트 함수 (direction=1 → 정방향 통과만 검출)."""
+    return y[0]
+_event_up_cross.direction = 1     # 음(-) → 양(+) 방향으로 지날 때만 기록
+_event_up_cross.terminal = False
+
+
+def simulate(m_g, l_m, theta0_deg, rng):
+    """
+    한 번의 '실험'을 수행한다. 동일한 입력값이라도 rng 가 만들어내는
+    미세 오차 요인(실 떨림·초기 횡방향 흔들림·진동수 어긋남)이 매번 달라지므로
+    측정 결과 또한 독립적으로 달라진다.
+    반환: 결과 딕셔너리
+    """
+    m  = m_g / 1000.0                 # g → kg
+    th0 = np.deg2rad(theta0_deg)      # deg → rad
+    r, A_cs = _bob_geometry(m)
+
+    # ---- (a) 무작위 오차 요인 생성 -------------------------------------------------
+    A_str = abs(rng.normal(0.0, 0.0015)) * l_m          # 실 떨림 진폭 (길이의 ~0.15%)
+    f_str = rng.uniform(15.0, 30.0)                     # 실 떨림 주파수 [Hz]
+    eps   = rng.uniform(-0.02, 0.02)                    # 직교 방향 진동수 어긋남
+    psi0  = th0 * rng.uniform(0.010, 0.040) * rng.choice([-1.0, 1.0])   # 초기 횡방향 각
+    dpsi0 = th0 * rng.uniform(0.000, 0.015) * rng.choice([-1.0, 1.0])   # 초기 횡방향 각속도
+
+    p = {
+        "m": m, "l0": l_m,
+        "A_str": A_str, "w_str": 2.0 * np.pi * f_str, "ph_str": rng.uniform(0, 2 * np.pi),
+        "eps": eps,
+        "b_lin": 6.0 * np.pi * MU_AIR * r * DRAG_SCALE,          # 선형 저항 b
+        "k_qua": 0.5 * C_D * RHO_AIR * A_cs * DRAG_SCALE,        # 2차 저항 ½C_dρA
+    }
+
+    # ---- (b) 적분 구간 : 이론 주기로부터 넉넉하게 추정 -----------------------------
+    T_theory = 2.0 * np.pi * np.sqrt(l_m / G)
+    T_corr   = T_theory * (1.0 + th0 ** 2 / 16.0)
+    t_end    = T_corr * (N_CYCLES + 3.0)
+
+    sol = solve_ivp(
+        _rhs, (0.0, t_end), [th0, 0.0, psi0, dpsi0],
+        args=(p,), method="RK45",
+        rtol=1e-8, atol=1e-10, max_step=0.01,      # 코랩에서 1회 계산 0.5초 내외
+        dense_output=True, events=_event_up_cross,
+    )
+
+    # ---- (c) 주기 검출 : 영점을 '정방향'으로 통과한 시각들 -------------------------
+    crossings = np.asarray(sol.t_events[0], dtype=float)
+    if crossings.size >= N_CYCLES + 1:
+        t_first, t_last = crossings[0], crossings[N_CYCLES]
+        n_used = N_CYCLES
+    elif crossings.size >= 2:                            # 감쇠가 심한 예외 상황 대비
+        t_first, t_last = crossings[0], crossings[-1]
+        n_used = crossings.size - 1
+    else:
+        raise RuntimeError("주기를 검출하지 못했습니다. 입력값을 조정해 주세요.")
+
+    t_span_phys = t_last - t_first                       # 물리적 10회 왕복 시간
+    T_phys = t_span_phys / n_used                        # 물리적 평균 주기
+
+    # ---- (d) 인간의 측정 오차 delta (절단 정규분포, ±10%) --------------------------
+    while True:
+        delta = rng.normal(0.0, DELTA_SIG)
+        if abs(delta) <= DELTA_MAX:
+            break
+    T_meas = T_phys * (1.0 + delta)
+    t_span_meas = T_meas * n_used
+
+    # ---- (e) 궤적 샘플링 (시각화용, 메모리 절약을 위해 고정 개수만 저장) ------------
+    ts = np.linspace(0.0, min(t_last + 0.4, t_end), 1600)
+    Y  = sol.sol(ts)
+    th_s, ps_s = Y[0], Y[2]
+    l_s = _string_length(ts, p)
+
+    sx = np.sin(th_s)
+    sy = np.sin(ps_s)
+    sz = np.sqrt(np.clip(1.0 - sx ** 2 - sy ** 2, 0.0, None))
+    X, Yc, Z = l_s * sx, l_s * sy, -l_s * sz             # 지지점을 원점으로 하는 좌표
+
+    return {
+        "m_g": m_g, "l_m": l_m, "theta0_deg": theta0_deg,
+        "n_used": n_used,
+        "T_phys": T_phys, "T_meas": T_meas, "delta": delta,
+        "t_span_phys": t_span_phys, "t_span_meas": t_span_meas,
+        "T_theory": T_theory, "T_corr": T_corr,
+        "ts": ts, "th": th_s, "X": X, "Y": Yc, "Z": Z,
+        "cross": crossings[: n_used + 1],
+        "A_str": A_str, "f_str": f_str, "eps": eps, "r_bob": r,
+    }
+
+
+# =====================================================================================
+# 2. 시각화 : 3차원 궤적 + 각변위 그래프
+# =====================================================================================
+def draw_figure(res):
+    """왼쪽 : 3차원 궤적 / 가운데 : 위에서 본 x–y 궤적 / 오른쪽 : 각변위 θ(t)."""
+    X, Y, Z, ts, th = res["X"], res["Y"], res["Z"], res["ts"], res["th"]
+    l_m = res["l_m"]
+
+    fig = plt.figure(figsize=(12.6, 4.3))
+    gs  = fig.add_gridspec(1, 3, width_ratios=[1.05, 0.82, 1.20], wspace=0.34)
+    ax3 = fig.add_subplot(gs[0, 0], projection="3d")
+    axt = fig.add_subplot(gs[0, 1])
+    ax2 = fig.add_subplot(gs[0, 2])
+
+    # ---------- (1) 3차원 궤적 ----------
+    ax3.plot(X, Y, Z, lw=0.8, color="#3b6ea5", alpha=0.85)
+    ax3.scatter([X[0]], [Y[0]], [Z[0]], s=28, color="#d1495b", zorder=5)
+    ax3.scatter([0], [0], [0], marker="s", s=26, color="#444444")      # 지지점
+
+    lim = max(l_m * np.sin(np.deg2rad(res["theta0_deg"])) * 1.25, l_m * 0.08)
+    ax3.set_xlim(-lim, lim)
+    ax3.set_ylim(-lim, lim)
+    ax3.set_zlim(-l_m * 1.05, 0.0)
+    ax3.set_xlabel("x [m]", fontsize=9)
+    ax3.set_ylabel("y [m]", fontsize=9)
+    ax3.set_zlabel("z [m]", fontsize=9)
+    ax3.set_title(L("traj3d"), fontsize=10.5, pad=6)
+    ax3.tick_params(labelsize=7)
+    ax3.view_init(elev=18, azim=-58)
+    ax3.set_box_aspect((1, 1, 0.95))
+
+    ax3.plot([0, X[0]], [0, Y[0]], [0, Z[0]], lw=1.1, color="#777777")   # 실
+    ax3.plot([X[0]], [Y[0]], [Z[0]], "o", ms=9, color="#d1495b")         # 추
+
+    # ---------- (2) 위에서 본 x–y 궤적 : 원뿔진자(리사주) 효과가 가장 잘 보인다 ----------
+    axt.plot(X, Y, lw=0.7, color="#8e6fb0", alpha=0.9)
+    axt.plot([X[0]], [Y[0]], "o", ms=5, color="#d1495b")
+    axt.axhline(0.0, lw=0.7, color="#cccccc")
+    axt.set_xlabel("x [m]", fontsize=9)
+    axt.set_ylabel(f"y [m]   ({L('note')})", fontsize=9)
+    axt.set_title(L("top"), fontsize=10.5, pad=14)   # 지수 표기(1e-2)와 겹치지 않도록
+    axt.tick_params(labelsize=7)
+    axt.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
+    axt.grid(alpha=0.22)
+
+    # ---------- (3) 각변위 θ(t) ----------
+    ax2.plot(ts, np.rad2deg(th), lw=1.0, color="#2a9d8f")
+    ax2.axhline(0.0, lw=0.8, color="#999999", ls="--")
+    cr = res["cross"]
+    ax2.plot(cr, np.zeros_like(cr), "v", ms=6, color="#e76f51", label=L("cross"))
+    ax2.set_xlabel(L("time"), fontsize=9)
+    ax2.set_ylabel(L("ang"), fontsize=9)
+    ax2.set_title(L("theta"), fontsize=11)
+    ax2.tick_params(labelsize=8)
+    ax2.grid(alpha=0.25)
+    ax2.legend(fontsize=8, loc="upper right")
+
+    # 3D 축이 섞여 있어 tight_layout 대신 여백을 직접 지정
+    fig.subplots_adjust(left=0.015, right=0.975, top=0.88, bottom=0.15)
+    plt.show()
+    plt.close(fig)              # 메모리 누수 방지 : 그린 즉시 figure 해제
+    gc.collect()
+
+
+def make_animation(res):
+    """
+    3차원 진자 운동 애니메이션(HTML) 생성.
+    코랩 메모리 보호를 위해 ① 전용 소형 figure ② 낮은 dpi ③ 프레임 수 제한을 적용하고,
+    생성 직후 figure 와 animation 객체를 즉시 해제한다.
+    """
+    X, Y, Z, l_m = res["X"], res["Y"], res["Z"], res["l_m"]
+    step = max(1, len(X) // FRAME_MAX)
+    idx  = np.arange(0, len(X), step)
+
+    fig = plt.figure(figsize=(4.6, 4.2), dpi=ANIM_DPI)
+    ax  = fig.add_subplot(111, projection="3d")
+    ax.plot(X, Y, Z, lw=0.5, color="#b8c6d6", alpha=0.8)
+
+    lim = max(l_m * np.sin(np.deg2rad(res["theta0_deg"])) * 1.25, l_m * 0.08)
+    ax.set_xlim(-lim, lim); ax.set_ylim(-lim, lim); ax.set_zlim(-l_m * 1.05, 0.0)
+    ax.set_xlabel("x [m]", fontsize=8); ax.set_ylabel("y [m]", fontsize=8)
+    ax.set_zlabel("z [m]", fontsize=8)
+    ax.tick_params(labelsize=6)
+    ax.view_init(elev=18, azim=-58)
+
+    line, = ax.plot([0, X[0]], [0, Y[0]], [0, Z[0]], lw=1.2, color="#666666")
+    bob,  = ax.plot([X[0]], [Y[0]], [Z[0]], "o", ms=9, color="#d1495b")
+    fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.05)
+
+    def _update(k):
+        i = idx[k]
+        line.set_data([0, X[i]], [0, Y[i]]); line.set_3d_properties([0, Z[i]])
+        bob.set_data([X[i]], [Y[i]]);        bob.set_3d_properties([Z[i]])
+        return line, bob
+
+    anim = animation.FuncAnimation(fig, _update, frames=len(idx),
+                                   interval=50, blit=False)
+    html = anim.to_jshtml(fps=20)
+    plt.close(fig)
+    del anim
+    gc.collect()
+    return html
+
+
+# =====================================================================================
+# 3. 실험 리포트(HTML) 생성
+# =====================================================================================
+def build_report(res, run_no, history):
+    """측정 결과와 이론값 비교를 담은 HTML 리포트 문자열을 생성."""
+    T_meas, T_th, T_co = res["T_meas"], res["T_theory"], res["T_corr"]
+    err_th = (T_meas - T_th) / T_th * 100.0
+    err_co = (T_meas - T_co) / T_co * 100.0
+    err_ph = (T_meas - res["T_phys"]) / res["T_phys"] * 100.0
+
+    def row(a, b, c=""):
+        return (f"<tr><td style='padding:5px 10px;border-bottom:1px solid #eee;"
+                f"color:#555'>{a}</td>"
+                f"<td style='padding:5px 10px;border-bottom:1px solid #eee;"
+                f"text-align:right;font-weight:600'>{b}</td>"
+                f"<td style='padding:5px 10px;border-bottom:1px solid #eee;"
+                f"text-align:right;color:#888'>{c}</td></tr>")
+
+    # 반복 측정 이력 (동일 조건에서 값이 어떻게 흩어지는지 확인)
+    hist_html = ""
+    if len(history) >= 2:
+        vals = np.array([h["T_meas"] for h in history])
+        items = "  ".join(f"<span style='display:inline-block;padding:2px 7px;margin:2px;"
+                          f"background:#eef3f8;border-radius:4px'>{v:.3f}</span>"
+                          for v in vals[-10:])
+        hist_html = (
+            "<div style='margin-top:12px;padding:10px 12px;background:#fafbfc;"
+            "border:1px solid #e6e9ec;border-radius:6px'>"
+            "<b style='font-size:13px'>동일 조건 반복 측정값 T<sub>측정</sub> [s]</b><br>"
+            f"<div style='margin:6px 0'>{items}</div>"
+            f"<span style='font-size:12px;color:#666'>평균 {vals.mean():.4f} s · "
+            f"표준편차 {vals.std(ddof=1):.4f} s · 측정 횟수 {len(vals)}회</span></div>"
+        )
+
+    return f"""
+    <div style="font-family:'Malgun Gothic','AppleGothic',sans-serif;font-size:13.5px;
+                line-height:1.6;max-width:640px;border:1px solid #e6e9ec;
+                border-radius:8px;padding:12px 16px">
+      <div style="font-size:15px;font-weight:700;margin-bottom:8px">
+        📋 진자 주기 측정 실험 리포트 &nbsp;
+        <span style="font-size:12px;color:#888">(제 {run_no} 회 측정)</span>
+      </div>
+
+      <table style="border-collapse:collapse;width:100%">
+        <tr><th colspan="3" style="text-align:left;background:#eef3f8;padding:5px 10px;
+            border-radius:4px">① 입력 변수</th></tr>
+        {row("진자의 질량 m", f"{res['m_g']:.0f} g", f"추 반지름 {res['r_bob']*100:.2f} cm")}
+        {row("실의 길이 l", f"{res['l_m']:.2f} m")}
+        {row("초기 방출 각도 θ₀", f"{res['theta0_deg']:.0f} °")}
+
+        <tr><th colspan="3" style="text-align:left;background:#eef3f8;padding:5px 10px;
+            border-radius:4px">② 실험 결과 (측정값)</th></tr>
+        {row(f"{res['n_used']}회 왕복 총 소요시간", f"{res['t_span_meas']:.3f} s")}
+        {row("1회 평균 주기 T<sub>측정</sub>", f"{res['T_meas']:.4f} s")}
+        {row("시뮬레이션 실제 주기 T<sub>물리</sub>", f"{res['T_phys']:.4f} s",
+             f"측정오차 {err_ph:+.2f} %")}
+
+        <tr><th colspan="3" style="text-align:left;background:#eef3f8;padding:5px 10px;
+            border-radius:4px">③ 이론값 비교</th></tr>
+        {row("소각도 이론 주기 T<sub>이론</sub>", f"{res['T_theory']:.4f} s",
+             f"{err_th:+.2f} %")}
+        {row("대각도 보정 주기 T<sub>보정</sub>", f"{res['T_corr']:.4f} s",
+             f"{err_co:+.2f} %")}
+      </table>
+
+      <div style="margin-top:10px;font-size:12px;color:#666">
+        · T<sub>이론</sub> = 2π√(l/g) &nbsp;|&nbsp;
+          T<sub>보정</sub> = T<sub>이론</sub>·(1 + θ₀²/16) &nbsp;(θ₀ 단위: rad)<br>
+        · 반영된 오차 요인 : 실 떨림 {res['A_str']*1000:.2f} mm @ {res['f_str']:.1f} Hz,
+          직교 진동수 어긋남 {res['eps']*100:+.2f} %, 반응시간 오차 δ = {res['delta']*100:+.2f} %
+      </div>
+      {hist_html}
+    </div>
+    """
+
+
+# =====================================================================================
+# 4. ipywidgets 사용자 인터페이스
+# =====================================================================================
+_STYLE  = {"description_width": "150px"}
+_LAYOUT = widgets.Layout(width="420px")
+
+w_mass  = widgets.FloatSlider(value=100.0, min=10.0,  max=500.0, step=5.0,
+                              description="진자의 질량 m [g]",
+                              readout_format=".0f", continuous_update=False,
+                              style=_STYLE, layout=_LAYOUT)
+w_len   = widgets.FloatSlider(value=1.00, min=0.20,  max=2.00,  step=0.05,
+                              description="실의 길이 l [m]",
+                              readout_format=".2f", continuous_update=False,
+                              style=_STYLE, layout=_LAYOUT)
+w_ang   = widgets.FloatSlider(value=20.0, min=5.0,   max=60.0,  step=1.0,
+                              description="초기 방출 각도 θ₀ [°]",
+                              readout_format=".0f", continuous_update=False,
+                              style=_STYLE, layout=_LAYOUT)
+w_anim  = widgets.Checkbox(value=False, description="3D 애니메이션 재생 (느림)",
+                           indent=False, layout=widgets.Layout(width="260px"))
+w_reset = widgets.Button(description="측정 이력 초기화", icon="trash",
+                         layout=widgets.Layout(width="170px"))
+w_run   = widgets.Button(description="실험 시작 / 다시 측정", button_style="primary",
+                         icon="play", layout=widgets.Layout(width="230px", height="40px"))
+
+out_plot   = widgets.Output(layout=widgets.Layout(width="100%", min_height="360px"))
+out_report = widgets.Output(layout=widgets.Layout(width="100%"))
+
+# 실행 상태 (측정 회차 · 동일 조건 반복 측정 이력)
+_state = {"run_no": 0, "key": None, "history": [], "rng": np.random.default_rng()}
+
+
+def _on_run(_):
+    """[실험 시작 / 다시 측정] 버튼 콜백 — 누를 때마다 독립된 오차로 재측정."""
+    w_run.disabled = True
+    try:
+        m, l, a = w_mass.value, w_len.value, w_ang.value
+
+        # 입력 변수가 바뀌면 반복 측정 이력을 새로 시작
+        key = (round(m, 3), round(l, 3), round(a, 3))
+        if key != _state["key"]:
+            _state["key"], _state["history"] = key, []
+
+        res = simulate(m, l, a, _state["rng"])     # 매 호출마다 새로운 난수 → 독립 측정
+        _state["run_no"] += 1
+        _state["history"].append({"T_meas": res["T_meas"]})
+
+        # ---- 그래프 출력 ----
+        with out_plot:
+            out_plot.clear_output(wait=True)       # 이전 렌더링을 먼저 비워 메모리 절약
+            draw_figure(res)
+            if w_anim.value:
+                display(HTML(make_animation(res)))
+
+        # ---- 리포트 출력 ----
+        with out_report:
+            out_report.clear_output(wait=True)
+            display(HTML(build_report(res, _state["run_no"], _state["history"])))
+
+        del res
+        gc.collect()
+    except Exception as e:
+        with out_report:
+            out_report.clear_output(wait=True)
+            display(HTML(f"<b style='color:#c0392b'>오류 발생: {e}</b>"))
+    finally:
+        w_run.disabled = False
+
+
+def _on_reset(_):
+    """반복 측정 이력만 지운다 (그래프·리포트는 유지)."""
+    _state["history"] = []
+    with out_report:
+        out_report.clear_output(wait=True)
+        display(HTML("<span style='color:#666'>측정 이력을 초기화했습니다. "
+                     "[실험 시작] 버튼을 눌러 주세요.</span>"))
+
+
+w_run.on_click(_on_run)
+w_reset.on_click(_on_reset)
+
+_header = widgets.HTML(
+    "<div style=\"font-family:'Malgun Gothic','AppleGothic',sans-serif\">"
+    "<h3 style='margin:4px 0'>🔬 진자 운동 주기 측정 실험 "
+    "<span style='font-size:13px;color:#888'>— 3차원 오차 요인 반영</span></h3>"
+    "<div style='font-size:13px;color:#555;margin-bottom:6px'>"
+    "변수를 설정한 뒤 <b>[실험 시작 / 다시 측정]</b> 을 누르세요. "
+    "같은 조건이라도 실의 떨림·공기 와류·반응 시간 오차 때문에 매번 다른 값이 측정됩니다."
+    "</div></div>")
+
+_ui = widgets.VBox([
+    _header,
+    widgets.HBox([widgets.VBox([w_mass, w_len, w_ang]),
+                  widgets.VBox([w_run, w_anim, w_reset])]),
+    out_plot,        # 상단 : 3차원 궤적 · 위에서 본 궤적 · θ(t) 그래프
+    out_report,      # 하단 : 실험 리포트
+])
+
+display(_ui)
+
+# 첫 실행 안내
+with out_report:
+    display(HTML("<span style='color:#666;font-family:sans-serif'>"
+                 "▶ [실험 시작 / 다시 측정] 버튼을 눌러 첫 측정을 시작하세요.</span>"))
